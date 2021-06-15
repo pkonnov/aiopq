@@ -1,0 +1,7 @@
+main.py
+var/
+venv/
+tests/
+
+.idea/
+*__pycache__
