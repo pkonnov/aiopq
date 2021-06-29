@@ -1,11 +1,17 @@
 import asyncio
-import json
+from datetime import datetime
+from typing import Union
+
+import orjson
 import logging
 import os
 from contextlib import asynccontextmanager
 from weakref import WeakValueDictionary
 
-from .utils import Literal, utc_format
+from asyncpg import Record
+
+from .job import Job
+from .utils import Literal
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +62,7 @@ class AQueueIterator(object):
         return self
 
     async def __anext__(self):
-        return await self.queue.get(timeout=self.timeout)
+        return await self.queue.get()
 
 
 class Queue:
@@ -66,10 +72,10 @@ class Queue:
 
     dumps = loads = staticmethod(lambda data: data)
 
-    encode = staticmethod(json.dumps)
-    decode = staticmethod(json.loads)
+    encode = staticmethod(orjson.dumps)
+    decode = staticmethod(orjson.loads)
 
-    def __init__(self, name, conn=None, pool=None, table_name='queue', schema=None, **kwargs):
+    def __init__(self, name, conn=None, pool=None, table_name='queue', schema=None):
         self.conn = conn
         self.pool = pool
         self.name = name
@@ -78,12 +84,12 @@ class Queue:
     def __aiter__(self):
         return AQueueIterator(self)
 
-    async def get(self, block: bool = True, timeout: float = None):
+    async def get(self, timeout: float = None) -> Union[Job, None]:
         while True:
             if timeout:
                 await asyncio.sleep(timeout)
             async with self.transaction() as init_conn:
-                job = await self._pull_item(init_conn, block)
+                job = await self._pull_item(init_conn)
             if job:
                 (
                     job_id,
@@ -92,7 +98,7 @@ class Queue:
                     enqueued_at,
                     schedule_at,
                 ) = job
-                decoded = self.decode(data)
+                decoded = self.decode(data.encode())
 
                 return Job(
                     job_id, self.loads(decoded), size, enqueued_at, schedule_at
@@ -104,7 +110,15 @@ class Queue:
         except Exception as ex:
             logger.error(ex)
 
-    async def _pull_item(self, conn, block=True):
+    async def put(self, name: str, data: dict, schedule_at: datetime) -> int:
+        async with self.transaction() as init_conn:
+            job_id = await self._put_item(init_conn,
+                                          name=name,
+                                          data=data,
+                                          schedule_at=schedule_at)
+            return job_id[0].get('id')
+
+    async def _pull_item(self, conn):
         # This method uses the following query:
         """
         WITH
@@ -112,7 +126,8 @@ class Queue:
             SELECT * FROM {table_name}
             WHERE
               q_name = '{name}' AND
-              dequeued_at IS NULL
+              dequeued_at IS NULL AND
+              schedule_at <= now()
             ORDER BY schedule_at nulls first, id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -123,27 +138,32 @@ class Queue:
             WHERE
               t.id = selected.id AND
               (t.schedule_at <= now() OR t.schedule_at is NULL)
-            RETURNING t.data, length(t.data::text) AS length
           )
         SELECT
           id,
-          (SELECT data::text FROM updated),
-          (SELECT length FROM updated),
+          data::text,
+          length(data::text),
           enqueued_at AT TIME ZONE 'utc' AS enqueued_at,
           schedule_at AT TIME ZONE 'utc' AS schedule_at
         FROM selected
         """
-        job = await conn.fetch(self._pull_item.__doc__.format(table_name=self.table_name, name=self.name))
+        q = self._pull_item.__doc__.format(table_name=self.table_name, name=self.name)
+        job = await conn.fetch(q)
         if job:
             return job[0]
         return
 
-    async def _put_item(self, conn, **kwargs):
+    async def _put_item(self, conn, *, name: str, data: dict, schedule_at: datetime) -> Record:
         """
-        INSERT INTO {table_name} (q_name, data, schedule_at, expected_at)
-        VALUES ({name}, {data}, {schedule_at}, {expected_at}) RETURNING id
+        INSERT INTO {table_name} (q_name, data, schedule_at)
+        VALUES ('{name}', '{data}', '{schedule_at}') RETURNING id
         """
-        return await conn.execute(self._put_item.__doc__.format(table_name=self.table_name, **kwargs))
+        data = self.encode(data)
+        q = self._put_item.__doc__.format(table_name=self.table_name,
+                                          name=name,
+                                          data=data.decode('utf-8'),
+                                          schedule_at=str(schedule_at))
+        return await conn.fetch(q)
 
     @asynccontextmanager
     async def transaction(self):
@@ -156,40 +176,3 @@ class Queue:
             raise ex
         else:
             await tr.commit()
-
-
-class Job(object):
-    """An item in the queue."""
-
-    __slots__ = (
-        "_data", "_size", "_id", "name", "enqueued_at", "schedule_at",
-        "dequeued_at",
-    )
-
-    def __init__(
-            self,
-            job_id,
-            data,
-            size,
-            enqueued_at,
-            schedule_at,
-    ):
-        self._data = data
-        self._size = size
-        self._id = job_id
-        self.enqueued_at = enqueued_at
-        self.schedule_at = schedule_at
-
-    def __repr__(self):
-        cls = type(self)
-        return (
-                '<%s.%s id=%d size=%d enqueued_at=%r '
-                'schedule_at=%r>' % (
-                    cls.__module__,
-                    cls.__name__,
-                    self._id,
-                    self._size,
-                    utc_format(self.enqueued_at),
-                    utc_format(self.schedule_at) if self.schedule_at else None,
-                )
-        ).replace("'", '"')
