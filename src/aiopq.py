@@ -8,7 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from weakref import WeakValueDictionary
 
-from asyncpg import Record
+from asyncpg.protocol.protocol import Record
 
 from .job import Job
 from .utils import Literal
@@ -22,12 +22,12 @@ class AioPQ:
     template_schema = os.path.dirname(__file__)
     queue_class = None
 
-    def __init__(self, *args, **kwargs):
-        queue_class = kwargs.pop('queue_class', None)
+    def __init__(self, pool, queue_class=None):
+        self.pool = pool
         if queue_class is not None:
             self.queue_class = queue_class
-        self.params = args, kwargs
         self.queues = WeakValueDictionary()
+        logger.debug('Init AioPQ')
 
     def __getitem__(self, name):
         try:
@@ -37,11 +37,8 @@ class AioPQ:
             if factory is None:
                 factory = Queue
             return self.queues.setdefault(
-                name, factory(name, *self.params[0], **self.params[1])
+               name, factory(name, self.pool)
             )
-
-    def close(self):
-        self[''].close()
 
     async def create(self):
         queue = self['']
@@ -66,17 +63,13 @@ class AQueueIterator(object):
 
 
 class Queue:
-    """
-    conn : asyncpg.connect
-    """
 
     dumps = loads = staticmethod(lambda data: data)
 
     encode = staticmethod(orjson.dumps)
     decode = staticmethod(orjson.loads)
 
-    def __init__(self, name, conn=None, pool=None, table_name='queue', schema=None):
-        self.conn = conn
+    def __init__(self, name, pool=None, table_name='queue', schema=None):
         self.pool = pool
         self.name = name
         self.table_name = Literal((schema + "." if schema else "") + table_name)
@@ -99,16 +92,11 @@ class Queue:
                     schedule_at,
                 ) = job
                 decoded = self.decode(data.encode())
-
-                return Job(
+                _job = Job(
                     job_id, self.loads(decoded), size, enqueued_at, schedule_at
                 )
-
-    async def listen(self, conn):
-        try:
-            await conn.execute('LISTEN %s' % self.name)
-        except Exception as ex:
-            logger.error(ex)
+                logger.debug('Delete %s from queue', _job)
+                return _job
 
     async def put(self, name: str, data: dict, schedule_at: datetime) -> int:
         async with self.transaction() as init_conn:
@@ -167,12 +155,14 @@ class Queue:
 
     @asynccontextmanager
     async def transaction(self):
-        tr = self.conn.transaction()
-        await tr.start()
         try:
-            yield self.conn
+            async with self.pool.acquire() as conn:
+                async with conn.transaction() as _:
+                    yield conn
         except Exception as ex:
-            await tr.rollback()
-            raise ex
-        else:
-            await tr.commit()
+            logger.exception(ex)
+            await self.close()
+
+    async def close(self):
+        self.pool.close()
+        logger.debug('Connection with id %s', self.pool.id)

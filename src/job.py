@@ -1,3 +1,7 @@
+from datetime import datetime
+
+import orjson
+
 from src.utils import utc_format
 
 
@@ -11,11 +15,11 @@ class Job(object):
 
     def __init__(
             self,
-            job_id,
-            data,
-            size,
-            enqueued_at,
-            schedule_at,
+            job_id: int,
+            data: dict,
+            size: int,
+            enqueued_at: datetime,
+            schedule_at: datetime,
     ):
         self._data = data
         self._size = size
@@ -26,12 +30,13 @@ class Job(object):
     def __repr__(self):
         cls = type(self)
         return (
-                '<%s.%s id=%d size=%d enqueued_at=%r '
+                '<%s.%s id=%d size=%d data=%s enqueued_at=%r '
                 'schedule_at=%r>' % (
                     cls.__module__,
                     cls.__name__,
                     self._id,
                     self._size,
+                    orjson.dumps(self._data),
                     utc_format(self.enqueued_at),
                     utc_format(self.schedule_at) if self.schedule_at else None,
                 )
