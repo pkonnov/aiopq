@@ -1,35 +1,35 @@
 import asyncio
-from datetime import datetime
-from typing import Union
-
-import orjson
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, AsyncContextManager, Union
 from weakref import WeakValueDictionary
 
+import orjson
+from asyncpg.connection import connect
 from asyncpg.protocol.protocol import Record
 
 from .job import Job
 from .utils import Literal
 
-
 logger = logging.getLogger(__name__)
 
 
 class AioPQ:
-    table_name = 'queue'
+    table_name = "queue"
     template_schema = os.path.dirname(__file__)
     queue_class = None
 
-    def __init__(self, pool, queue_class=None):
+    def __init__(self, pool, queue_class=None, timeout=None) -> None:
         self.pool = pool
+        self.timeout = timeout if timeout else 0.5
         if queue_class is not None:
             self.queue_class = queue_class
         self.queues = WeakValueDictionary()
-        logger.debug('Init AioPQ')
+        logger.debug("Init AioPQ")
 
-    def __getitem__(self, name):
+    def __getitem__(self, name) -> "Queue":
         try:
             return self.queues[name]
         except KeyError:
@@ -37,13 +37,13 @@ class AioPQ:
             if factory is None:
                 factory = Queue
             return self.queues.setdefault(
-               name, factory(name, self.pool)
+                name, factory(name, pool=self.pool, timeout=self.timeout)
             )
 
-    async def create(self):
-        queue = self['']
+    async def create(self) -> None:
+        queue = self[""]
 
-        with open(os.path.join(self.template_schema, 'create.sql')) as f:
+        with open(os.path.join(self.template_schema, "create.sql")) as f:
             sql = f.read()
 
         async with queue.transaction() as init_conn:
@@ -51,15 +51,14 @@ class AioPQ:
 
 
 class AQueueIterator(object):
-
     def __init__(self, queue):
-        self.queue = queue
+        self.queue: Queue = queue
 
-    def __aiter__(self):
+    def __aiter__(self) -> "AQueueIterator":
         return self
 
-    async def __anext__(self):
-        return await self.queue.get()
+    async def __anext__(self) -> Job:
+        return await self.queue.get(timeout=self.queue.timeout)
 
 
 class Queue:
@@ -69,44 +68,46 @@ class Queue:
     encode = staticmethod(orjson.dumps)
     decode = staticmethod(orjson.loads)
 
-    def __init__(self, name, pool=None, table_name='queue', schema=None):
+    def __init__(
+        self, name, *, pool=None, table_name="queue", schema=None, timeout=None
+    ):
         self.pool = pool
         self.name = name
+        self.timeout = timeout
         self.table_name = Literal((schema + "." if schema else "") + table_name)
 
-    def __aiter__(self):
+    def __aiter__(self) -> AQueueIterator:
         return AQueueIterator(self)
 
     async def get(self, timeout: float = None) -> Union[Job, None]:
         while True:
-            if timeout:
-                await asyncio.sleep(timeout)
             async with self.transaction() as init_conn:
                 job = await self._pull_item(init_conn)
-            if job:
-                (
-                    job_id,
-                    data,
-                    size,
-                    enqueued_at,
-                    schedule_at,
-                ) = job
-                decoded = self.decode(data.encode())
-                _job = Job(
-                    job_id, self.loads(decoded), size, enqueued_at, schedule_at
-                )
-                logger.debug('Delete %s from queue', _job)
-                return _job
+                if timeout:
+                    await asyncio.sleep(timeout)
+                if job:
+                    (
+                        job_id,
+                        data,
+                        size,
+                        enqueued_at,
+                        schedule_at,
+                    ) = job
+                    decoded = self.decode(data.encode())
+                    _job = Job(
+                        job_id, self.loads(decoded), size, enqueued_at, schedule_at
+                    )
+                    logger.debug("Delete %s from queue", _job)
+                    return _job
 
     async def put(self, name: str, data: dict, schedule_at: datetime) -> int:
         async with self.transaction() as init_conn:
-            job_id = await self._put_item(init_conn,
-                                          name=name,
-                                          data=data,
-                                          schedule_at=schedule_at)
-            return job_id[0].get('id')
+            job_id = await self._put_item(
+                init_conn, name=name, data=data, schedule_at=schedule_at
+            )
+            return job_id[0].get("id")
 
-    async def _pull_item(self, conn):
+    async def _pull_item(self, conn: connect):
         # This method uses the following query:
         """
         WITH
@@ -141,20 +142,27 @@ class Queue:
             return job[0]
         return
 
-    async def _put_item(self, conn, *, name: str, data: dict, schedule_at: datetime) -> Record:
+    async def _put_item(
+        self, conn: connect, *, name: str, data: dict, schedule_at: datetime
+    ) -> Record:
         """
         INSERT INTO {table_name} (q_name, data, schedule_at)
         VALUES ('{name}', '{data}', '{schedule_at}') RETURNING id
         """
         data = self.encode(data)
-        q = self._put_item.__doc__.format(table_name=self.table_name,
-                                          name=name,
-                                          data=data.decode('utf-8'),
-                                          schedule_at=str(schedule_at))
+        q = self._put_item.__doc__.format(
+            table_name=self.table_name,
+            name=name,
+            data=data.decode("utf-8"),
+            schedule_at=str(schedule_at),
+        )
         return await conn.fetch(q)
 
+    async def update_item(self):
+        pass
+
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self) -> Union[AsyncContextManager, Any]:
         try:
             async with self.pool.acquire() as conn:
                 async with conn.transaction() as _:
@@ -163,6 +171,6 @@ class Queue:
             logger.exception(ex)
             await self.close()
 
-    async def close(self):
+    async def close(self) -> None:
         self.pool.close()
-        logger.debug('Connection with id %s', self.pool.id)
+        logger.debug("Connection with id %s", self.pool.id)

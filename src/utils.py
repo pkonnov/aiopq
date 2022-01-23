@@ -4,20 +4,20 @@ from datetime import timedelta
 class Literal(object):
     """String wrapper to make a query parameter literal."""
 
-    __slots__ = "s",
+    __slots__ = ("s",)
 
     def __init__(self, s):
-        self.s = str(s).encode('utf-8')
+        self.s = str(s).encode("utf-8")
 
     def __conform__(self, quote):
         return self
 
     def __str__(self):
-        return self.s.decode('utf-8')
+        return self.s.decode("utf-8")
 
     @classmethod
     def mro(cls):
-        return (object, )
+        return (object,)
 
     def getquoted(self):
         return self.s

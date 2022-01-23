@@ -2,7 +2,7 @@ version: '3.5'
 
 services:
   postgres:
-    container_name: postgres_container
+    container_name: aiopq_db
     image: library/postgres:12-alpine
     environment:
       - POSTGRES_USER=user
@@ -13,12 +13,12 @@ services:
     ports:
       - "5432:5432"
     networks:
-      - postgres
+      - aiopq
     restart: unless-stopped
 
 networks:
-  postgres:
+  aiopq:
     driver: bridge
 
 volumes:
-    postgres:
+    aiopq:
