@@ -3,7 +3,7 @@ version: '3.5'
 services:
   postgres:
     container_name: aiopq_db
-    image: library/postgres:12-alpine
+    image: library/postgres:14-alpine
     environment:
       - POSTGRES_USER=user
       - POSTGRES_PASSWORD=123456

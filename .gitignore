@@ -2,6 +2,8 @@ main.py
 var/
 venv/
 tests/
+tmp*
+.po_*
 
 .idea/
 *__pycache__
