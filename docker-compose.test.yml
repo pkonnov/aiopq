@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_USER: aiopq
+      POSTGRES_PASSWORD: aiopq
+      POSTGRES_DB: aiopq
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiopq -d aiopq"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["python", "tests/app.py"]
+    environment:
+      DATABASE_URL: postgresql://aiopq:aiopq@db:5432/aiopq
+      QUEUE_NAME: tasks
+      WORKER_COUNT: "3"
+      MAX_ATTEMPTS: "2"
+      LEASE_SECONDS: "5"
+      POLL_INTERVAL: "0.05"
+      PORT: "8080"
+    expose:
+      - "8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["pytest", "-q", "tests"]
+    environment:
+      API_URL: http://app:8080
+      DATABASE_URL: postgresql://aiopq:aiopq@db:5432/aiopq
+      MAX_ATTEMPTS: "2"
+    depends_on:
+      app:
+        condition: service_healthy
+      db:
+        condition: service_healthy

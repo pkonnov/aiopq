@@ -6,7 +6,6 @@ import logging
 from typing import Optional
 
 import asyncpg
-import orjson
 from aiohttp import web
 
 from aiopq import AioPQ
@@ -29,53 +28,63 @@ class TestQueue:
 
         pool = await asyncpg.create_pool(
             dsn="postgres://user:123456@localhost:5432/aiopq?application_name=myapp",
-            max_size=3,
+            max_size=10,
             min_size=1,
         )
-        aiopq_init = AioPQ(pool)
+        aiopq_init = AioPQ(
+            pool,
+            poll_interval=0.5,
+            lease_seconds=30,
+            max_attempts=3,
+        )
         await aiopq_init.create()
         cls.queue = aiopq_init
 
+    @classmethod
+    async def close(cls):
+        if cls.queue:
+            await cls.queue.close()
+            cls.queue = None
 
-async def do_something_with_task_lol():
-    async for task in TestQueue.queue["lol"]:
-        if task:
-            # do something useful
-            pass
+
+async def process(queue_name: str):
+    queue = TestQueue.queue[queue_name]
+    async for task in queue:
+        try:
+            # do something useful with task.data
+            logger.debug("processing %s", task)
+        except Exception as exc:
+            # Requeue (or move to the dead-letter state after max_attempts).
+            await queue.nack(task, error=exc)
         else:
-            continue
-
-
-async def do_something_with_task_test():
-    async for task in TestQueue.queue["test"]:
-        if task:
-            # do something useful
-            pass
-        else:
-            continue
+            # Mark the job as successfully processed.  Jobs that are never
+            # acked are retried after lease_seconds.
+            await queue.ack(task)
 
 
 async def create_task(request):
     data = await request.json()
-    scheduled_at = datetime.datetime.now(
-        tz=datetime.timezone(datetime.timedelta(hours=3))
-    ) + datetime.timedelta(minutes=1)
-    task_queue = TestQueue.queue[data["queue_name"]]
-    task = await task_queue.put(data["task_name"], data, scheduled_at)
-    return web.Response(
-        body=orjson.dumps({"task_id": task}),
-        headers={"Content-Type": "applications/json"},
+    scheduled_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        minutes=1
     )
+    queue = TestQueue.queue[data["queue_name"]]
+    task_id = await queue.put(data["queue_name"], data, scheduled_at)
+    return web.json_response({"task_id": task_id})
+
+
+async def close_queue(app):
+    await TestQueue.close()
 
 
 async def run():
     app = web.Application()
     app.add_routes([web.post("/create-task", create_task)])
+    app.on_cleanup.append(close_queue)
 
     await TestQueue.create_test_queue()
 
-    asyncio.create_task(do_something_with_task_test())
-    asyncio.create_task(do_something_with_task_lol())
+    asyncio.create_task(process("test"))
+    asyncio.create_task(process("lol"))
 
     return app
 
@@ -84,6 +93,13 @@ if __name__ == "__main__":
     logger.debug("run")
     web.run_app(run(), port=9000)
 ```
+
+The queue uses explicit acknowledgements: after successful processing call
+`queue.ack(job)`; on failure call `queue.nack(job, error=exc)`.  A job that is
+not acknowledged within `lease_seconds` becomes available to another worker
+again, and after `max_attempts` failures it is kept in the dead-letter state
+(see `queue.get_failed()` / `queue.requeue(job)`).
+
 #### POST request to http://localhost:9000/create-task with json object:
 ```json
 {
@@ -91,3 +107,26 @@ if __name__ == "__main__":
   "queue_name": "lol"
 }
 ```
+
+## Tests
+
+Интеграционные тесты запускаются в Docker Compose из трёх сервисов:
+
+- `db` — PostgreSQL;
+- `app` — HTTP-сервер очереди (`tests/app.py`);
+- `tests` — отдельный контейнер с pytest.
+
+```bash
+docker compose -f docker-compose.test.yml up --build \
+  --abort-on-container-exit --exit-code-from tests
+```
+
+Остановка и очистка:
+
+```bash
+docker compose -f docker-compose.test.yml down -v
+```
+
+Тесты проверяют HTTP API, параллельную обработку, retry/dead-letter,
+отложенные задачи, защиту от SQL-инъекций и поведение lease/ack на уровне
+библиотеки. Подробнее — [tests/README.md](tests/README.md).
