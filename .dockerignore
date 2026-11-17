@@ -1,0 +1,11 @@
+.git
+.idea
+var
+tmp
+venv
+.test_venv
+__pycache__
+*.pyc
+.pytest_cache
+plans
+poetry.lock

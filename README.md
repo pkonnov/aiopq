@@ -107,3 +107,26 @@ again, and after `max_attempts` failures it is kept in the dead-letter state
   "queue_name": "lol"
 }
 ```
+
+## Tests
+
+Интеграционные тесты запускаются в Docker Compose из трёх сервисов:
+
+- `db` — PostgreSQL;
+- `app` — HTTP-сервер очереди (`tests/app.py`);
+- `tests` — отдельный контейнер с pytest.
+
+```bash
+docker compose -f docker-compose.test.yml up --build \
+  --abort-on-container-exit --exit-code-from tests
+```
+
+Остановка и очистка:
+
+```bash
+docker compose -f docker-compose.test.yml down -v
+```
+
+Тесты проверяют HTTP API, параллельную обработку, retry/dead-letter,
+отложенные задачи, защиту от SQL-инъекций и поведение lease/ack на уровне
+библиотеки. Подробнее — [tests/README.md](tests/README.md).
